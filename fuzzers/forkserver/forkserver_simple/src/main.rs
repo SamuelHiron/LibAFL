@@ -93,15 +93,14 @@ pub fn main() {
     // The unix shmem provider supported by AFL++ for shared memory
     let mut shmem_provider = UnixShMemProvider::new().unwrap();
 
-    // The coverage map shared between observer and executor
-    let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
-    // let the forkserver know the shmid
+    // ✅ SHM COVERAGE uniquement — séparée de l'input
+    let mut coverage_shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
     unsafe {
-        shmem.write_to_env("__AFL_SHM_ID").unwrap();
+        coverage_shmem.write_to_env("__AFL_SHM_ID").unwrap(); // coverage bitmap seulement
     }
-    let shmem_buf = shmem.as_slice_mut();
+    let shmem_buf = coverage_shmem.as_slice_mut();
 
-    // Create an observation channel using the signals map
+    // ❌ SHM INPUT supprimée — input via fichier @@ ou stdin
     let edges_observer = unsafe {
         HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
     };
@@ -165,14 +164,18 @@ pub fn main() {
     let args = opt.arguments;
 
     let observer_ref = edges_observer.handle();
-
+    let executable: String = opt.executable.clone();
     let mut tokens = Tokens::new();
     let mut executor = ForkserverExecutor::builder()
-        .program(opt.executable)
+        .program(executable) //cloned
         .debug_child(debug_child)
-        .shmem_provider(&mut shmem_provider)
+        // ❌ .shmem_provider(&mut shmem_provider) supprimé — plus de SHM input
+        .parse_afl_cmdline(args)   // args doit contenir @@
+        // Forkserver custom (plus de runtime AFL dans le binaire)
+        .env("LD_PRELOAD", "./forkserver_preload.so")  // ✅ fork server custom à l'entrypoint
+        .env("AFL_MAP_ADDR", "0x6800000000")  // ✅ adresse fixe bitmap
+        .env("FUZZ_TARGET", &opt.executable)  // ✅ passé au preload pour strace
         .autotokens(&mut tokens)
-        .parse_afl_cmdline(args)
         .coverage_map_size(MAP_SIZE)
         .timeout(Duration::from_millis(opt.timeout))
         .kill_signal(opt.signal)
