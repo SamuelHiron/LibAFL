@@ -1,10 +1,11 @@
+
 use core::time::Duration;
 use std::path::PathBuf;
 
 use clap::Parser;
 use libafl::{
     HasMetadata,
-    corpus::{Corpus, InMemoryCorpus, OnDiskCorpus, Testcase},
+    corpus::{Corpus, InMemoryCorpus, OnDiskCorpus},
     events::SimpleEventManager,
     executors::{HasObservers, StdChildArgs, forkserver::ForkserverExecutor},
     feedback_and_fast, feedback_or,
@@ -93,14 +94,15 @@ pub fn main() {
     // The unix shmem provider supported by AFL++ for shared memory
     let mut shmem_provider = UnixShMemProvider::new().unwrap();
 
-    // ✅ SHM COVERAGE uniquement — séparée de l'input
-    let mut coverage_shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
+    // The coverage map shared between observer and executor
+    let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
+    // let the forkserver know the shmid
     unsafe {
-        coverage_shmem.write_to_env("__AFL_SHM_ID").unwrap(); // coverage bitmap seulement
+        shmem.write_to_env("__AFL_SHM_ID").unwrap();
     }
-    let shmem_buf = coverage_shmem.as_slice_mut();
+    let shmem_buf = shmem.as_slice_mut();
 
-    // ❌ SHM INPUT supprimée — input via fichier @@ ou stdin
+    // Create an observation channel using the signals map
     let edges_observer = unsafe {
         HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
     };
@@ -164,16 +166,14 @@ pub fn main() {
     let args = opt.arguments;
 
     let observer_ref = edges_observer.handle();
-    let executable: String = opt.executable.clone();
+
     let mut tokens = Tokens::new();
     let mut executor = ForkserverExecutor::builder()
-        .program(executable) //cloned
+        .program(opt.executable)
         .debug_child(debug_child)
-        // ❌ .shmem_provider(&mut shmem_provider) supprimé — plus de SHM input
-        .parse_afl_cmdline(args)   // args doit contenir -- target @@
-        // Proxy forkserver : bitmap hardware à adresse fixe
-        .env("AFL_MAP_ADDR", "0x6800000000")  // ✅ adresse fixe bitmap
+        .shmem_provider(&mut shmem_provider)
         .autotokens(&mut tokens)
+        .parse_afl_cmdline(args)
         .coverage_map_size(MAP_SIZE)
         .timeout(Duration::from_millis(opt.timeout))
         .kill_signal(opt.signal)
@@ -186,20 +186,16 @@ pub fn main() {
             .truncate(dynamic_map_size);
     }
 
-    // Chargement direct des seeds sans passer par le feedback
-    // → fonctionne même si le binaire n'est pas instrumenté (bitmap vide)
+    // In case the corpus is empty (on first run), reset
     if state.must_load_initial_inputs() {
-        for dir in &corpus_dirs {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let entry = entry.unwrap();
-                let path = entry.path();
-                if path.is_file() {
-                    let data = std::fs::read(&path).unwrap();
-                    let input = BytesInput::new(data);
-                    state.corpus_mut().add(Testcase::new(input)).unwrap();
-                }
-            }
-        }
+        state
+            .load_initial_inputs(&mut fuzzer, &mut executor, &mut mgr, &corpus_dirs)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to load initial corpus at {:?}: {:?}",
+                    &corpus_dirs, err
+                )
+            });
         println!("We imported {} inputs from disk.", state.corpus().count());
     }
 
